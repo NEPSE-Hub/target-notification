@@ -16,18 +16,21 @@ async function getCurrentPrices() {
         if (!response.ok) {
             throw new Error(`API responded with status ${response.status}`);
         }
-        const json = await response.json();
+        const data = await response.json(); // directly the array
 
-        // The API returns: { success: true, data: [ { symbol: "...", lastTradedPrice: ... }, ... ] }
-        if (!json.success || !json.data) {
-            throw new Error('Unexpected API response structure');
+        // Validate that it's an array
+        if (!Array.isArray(data)) {
+            throw new Error('API response is not an array');
         }
 
-        // Build a price map: { "MBJC": 285, "NIMB": 195, ... }
+        // Build price map: { "BFC": 538, "SABBL": 902, ... }
         const priceMap = {};
-        for (const item of json.data) {
-            if (item.symbol && item.lastTradedPrice) {
-                priceMap[item.symbol] = item.lastTradedPrice;
+        for (const item of data) {
+            if (item.symbol && item.lastTradedPrice !== undefined && item.lastTradedPrice !== null) {
+                const price = parseFloat(item.lastTradedPrice);
+                if (!isNaN(price)) {
+                    priceMap[item.symbol.toUpperCase()] = price; // ensure uppercase
+                }
             }
         }
 
@@ -35,7 +38,7 @@ async function getCurrentPrices() {
         return priceMap;
     } catch (error) {
         console.error('Failed to fetch NEPSE live data:', error);
-        return null; // Return null to indicate failure
+        return null;
     }
 }
 
