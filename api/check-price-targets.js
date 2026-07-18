@@ -9,7 +9,7 @@ const supabase = createClient(
 
 // --- Helper: Fetch current prices from the NEPSE API ---
 async function getCurrentPrices() {
-    const apiUrl = 'https://nepsehub-backend.vercel.app/core/live-nepse';
+    const apiUrl = 'https://nepse-hub-backend.vercel.app/api/core?route=live-nepse';
     try {
         console.log('Fetching live NEPSE data...');
         const response = await fetch(apiUrl);
