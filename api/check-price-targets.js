@@ -24,20 +24,18 @@ async function getCurrentPrices() {
         if (!response.ok) {
             throw new Error(`API responded with status ${response.status}`);
         }
-        const data = await response.json(); // directly the array
+        const data = await response.json();
 
-        // Validate that it's an array
         if (!Array.isArray(data)) {
             throw new Error('API response is not an array');
         }
 
-        // Build price map: { "BFC": 538, "SABBL": 902, ... }
         const priceMap = {};
         for (const item of data) {
             if (item.symbol && item.lastTradedPrice !== undefined && item.lastTradedPrice !== null) {
                 const price = parseFloat(item.lastTradedPrice);
                 if (!isNaN(price)) {
-                    priceMap[item.symbol.toUpperCase()] = price; // ensure uppercase
+                    priceMap[item.symbol.toUpperCase()] = price;
                 }
             }
         }
@@ -50,13 +48,22 @@ async function getCurrentPrices() {
     }
 }
 
-// --- Main Cron Job Handler (no authentication) ---
+// --- Helper: Check if a value is false (works with boolean, string, number) ---
+const isFalse = (val) => {
+    if (val === undefined || val === null) return false;
+    if (typeof val === 'boolean') return val === false;
+    if (typeof val === 'string') return val.toLowerCase() === 'false' || val === '0';
+    if (typeof val === 'number') return val === 0;
+    return false;
+};
+
+// --- Main Cron Job Handler ---
 export default async function handler(req, res) {
     const startTime = Date.now();
     console.log('Starting price target check...');
 
     try {
-        // Step 1: Fetch all active watchlist items (buy_triggered or sell_triggered still false)
+        // Step 1: Fetch all active watchlist items
         const { data: watchlist, error: fetchError } = await supabase
             .from('watchlist')
             .select('id, user_id, symbol, target_buy, target_sell, buy_triggered, sell_triggered')
@@ -64,14 +71,7 @@ export default async function handler(req, res) {
 
         if (fetchError) throw fetchError;
 
-        if (!watchlist || watchlist.length === 0) {
-            console.log('No active watchlist items found.');
-            return res.status(200).json({ message: 'No active targets to check.' });
-        }
-
         // Step 2: Fetch all active stop losses from transactions table
-        // Assuming stop_loss is a column in transactions table and we track if it's triggered
-        // We'll need to add stop_loss_triggered to transactions table or use a flag
         const { data: transactions, error: txError } = await supabase
             .from('transactions')
             .select('id, user_id, symbol, stop_loss, stop_loss_triggered')
@@ -80,10 +80,9 @@ export default async function handler(req, res) {
 
         if (txError) {
             console.error('Failed to fetch transactions with stop loss:', txError);
-            // Continue with watchlist processing even if transactions fail
         }
 
-        // Step 3: Fetch current prices from the single NEPSE endpoint
+        // Step 3: Fetch current prices
         const currentPrices = await getCurrentPrices();
         if (!currentPrices) {
             throw new Error('Failed to fetch current prices from NEPSE API');
@@ -92,57 +91,129 @@ export default async function handler(req, res) {
         // Step 3.5: Fetch user alert preferences from user_settings table
         const userSettingsMap = {};
         try {
+            console.log('🔍 Fetching user settings from DB...');
             const { data: settingsData, error: settingsError } = await supabaseSettings
                 .from('user_settings')
                 .select('*');
 
             if (settingsError) {
-                console.warn('Could not fetch user_settings, defaulting to enabled:', settingsError.message);
+                console.warn('⚠️ Could not fetch user_settings:', settingsError.message);
             } else if (settingsData) {
+                console.log(`📋 Retrieved ${settingsData.length} user settings records`);
+                
+                // Debug: Log all user IDs from settings
+                console.log('👤 User IDs in settings:', settingsData.map(row => row.user_id));
+                
                 for (const row of settingsData) {
                     if (row.user_id) {
+                        // Store the raw user_id as key (don't convert to lowercase yet)
+                        const userKey = String(row.user_id).trim();
+                        
+                        // Parse preferences if it's a string
                         let prefs = row.preferences || {};
                         if (typeof prefs === 'string') {
-                            try { prefs = JSON.parse(prefs); } catch (e) {}
+                            try { 
+                                prefs = JSON.parse(prefs); 
+                            } catch (e) {
+                                console.warn(`Failed to parse preferences for user ${userKey}:`, e.message);
+                                prefs = {};
+                            }
                         }
-                        const userKey = String(row.user_id).trim().toLowerCase();
-                        userSettingsMap[userKey] = { prefs, row };
-                        console.log(`📋 Loaded DB settings for user [${userKey}]:`, prefs);
+                        
+                        // Also check if preferences are stored directly in columns
+                        // (some tables have notif_buy, notif_sell, notif_stoploss as separate columns)
+                        userSettingsMap[userKey] = { 
+                            prefs, 
+                            row,
+                            // Store direct column values if they exist
+                            notif_buy: row.notif_buy ?? prefs['notif-buy'] ?? prefs['notif_buy'],
+                            notif_sell: row.notif_sell ?? prefs['notif-sell'] ?? prefs['notif_sell'],
+                            notif_stoploss: row.notif_stoploss ?? row['notif-stoploss'] ?? prefs['notif-stoploss'] ?? prefs['notif_stoploss']
+                        };
+                        
+                        console.log(`✅ Loaded settings for user [${userKey}]:`, {
+                            notif_buy: userSettingsMap[userKey].notif_buy,
+                            notif_sell: userSettingsMap[userKey].notif_sell,
+                            notif_stoploss: userSettingsMap[userKey].notif_stoploss
+                        });
                     }
                 }
             }
         } catch (err) {
-            console.warn('Error querying user_settings:', err.message);
+            console.warn('⚠️ Error querying user_settings:', err.message);
         }
 
-        const isFalse = (val) => val === false || val === 'false' || val === 0 || val === '0';
-
+        // Helper: Check if alert is enabled for a specific user and alert type
         const isAlertEnabled = (userId, alertType) => {
-            if (!userId) return true;
-            const key = String(userId).trim().toLowerCase();
-            const record = userSettingsMap[key];
-            if (!record) return true; // Default to enabled if no preferences row in DB
+            if (!userId) {
+                console.log('⚠️ No userId provided, defaulting to enabled');
+                return true;
+            }
+            
+            // Try both with and without trimming
+            const userIdStr = String(userId).trim();
+            
+            // Log the user ID we're checking
+            console.log(`🔍 Checking alert for user [${userIdStr}] type: ${alertType}`);
+            
+            // First try exact match
+            let record = userSettingsMap[userIdStr];
+            
+            // If not found, try case-insensitive match
+            if (!record) {
+                const matchingKey = Object.keys(userSettingsMap).find(
+                    key => key.toLowerCase() === userIdStr.toLowerCase()
+                );
+                if (matchingKey) {
+                    record = userSettingsMap[matchingKey];
+                    console.log(`🔄 Found case-insensitive match: ${matchingKey} for ${userIdStr}`);
+                }
+            }
+            
+            if (!record) {
+                console.log(`ℹ️ No settings found for user [${userIdStr}], defaulting to enabled`);
+                return true; // Default to enabled if no preferences row in DB
+            }
 
-            const { prefs, row } = record;
+            console.log(`📊 Record for user [${userIdStr}]:`, record);
 
+            let value;
             if (alertType === 'buy') {
-                const val = prefs['notif-buy'] ?? prefs['notif_buy'] ?? row['notif_buy'] ?? row['notif-buy'];
-                if (val !== undefined) return !isFalse(val);
+                value = record.notif_buy;
+            } else if (alertType === 'sell') {
+                value = record.notif_sell;
+            } else if (alertType === 'stop_loss') {
+                value = record.notif_stoploss;
             }
-            if (alertType === 'sell') {
-                const val = prefs['notif-sell'] ?? prefs['notif_sell'] ?? row['notif_sell'] ?? row['notif-sell'];
-                if (val !== undefined) return !isFalse(val);
+            
+            // If value is undefined, default to true (enabled)
+            if (value === undefined || value === null) {
+                console.log(`ℹ️ No specific setting for ${alertType} for user [${userIdStr}], defaulting to enabled`);
+                return true;
             }
-            if (alertType === 'stop_loss') {
-                const val = prefs['notif-stoploss'] ?? prefs['notif_stoploss'] ?? prefs['notif-stop-loss'] ?? row['notif_stoploss'] ?? row['notif-stoploss'];
-                if (val !== undefined) return !isFalse(val);
-            }
-
-            return true;
+            
+            const enabled = !isFalse(value);
+            console.log(`📌 Alert ${alertType} for user [${userIdStr}]: ${enabled ? 'ENABLED ✅' : 'DISABLED ⏸️'} (value: ${value})`);
+            return enabled;
         };
 
         // Step 4: Evaluate watchlist items (buy/sell targets)
         const updatesToProcess = [];
+
+        // Get unique user IDs for debugging
+        const allUserIds = new Set();
+        if (watchlist) {
+            for (const item of watchlist) {
+                allUserIds.add(String(item.user_id).trim());
+            }
+        }
+        if (transactions) {
+            for (const tx of transactions) {
+                allUserIds.add(String(tx.user_id).trim());
+            }
+        }
+        console.log('👥 All user IDs in watchlist/transactions:', Array.from(allUserIds));
+        console.log('👥 User IDs with settings:', Object.keys(userSettingsMap));
 
         for (const item of watchlist) {
             const currentPrice = currentPrices[item.symbol];
@@ -153,8 +224,9 @@ export default async function handler(req, res) {
 
             // Check Buy Condition
             if (!item.buy_triggered && item.target_buy !== null && currentPrice <= item.target_buy) {
-                if (!isAlertEnabled(item.user_id, 'buy')) {
-                    console.log(`⏸️ BUY target hit for ${item.symbol} (${currentPrice} <= ${item.target_buy}) but skipped for user ${item.user_id} (notif-buy toggle is OFF)`);
+                const userIdStr = String(item.user_id).trim();
+                if (!isAlertEnabled(userIdStr, 'buy')) {
+                    console.log(`⏸️ BUY target hit for ${item.symbol} (${currentPrice} <= ${item.target_buy}) but SKIPPED for user ${userIdStr} (notif-buy toggle is OFF)`);
                 } else {
                     console.log(`✅ BUY target hit for ${item.symbol}: ${currentPrice} <= ${item.target_buy}`);
                     updatesToProcess.push({
@@ -170,8 +242,9 @@ export default async function handler(req, res) {
             }
             // Check Sell Condition
             else if (!item.sell_triggered && item.target_sell !== null && currentPrice >= item.target_sell) {
-                if (!isAlertEnabled(item.user_id, 'sell')) {
-                    console.log(`⏸️ SELL target hit for ${item.symbol} (${currentPrice} >= ${item.target_sell}) but skipped for user ${item.user_id} (notif-sell toggle is OFF)`);
+                const userIdStr = String(item.user_id).trim();
+                if (!isAlertEnabled(userIdStr, 'sell')) {
+                    console.log(`⏸️ SELL target hit for ${item.symbol} (${currentPrice} >= ${item.target_sell}) but SKIPPED for user ${userIdStr} (notif-sell toggle is OFF)`);
                 } else {
                     console.log(`✅ SELL target hit for ${item.symbol}: ${currentPrice} >= ${item.target_sell}`);
                     updatesToProcess.push({
@@ -198,8 +271,9 @@ export default async function handler(req, res) {
 
                 // Check Stop Loss Condition
                 if (currentPrice <= tx.stop_loss) {
-                    if (!isAlertEnabled(tx.user_id, 'stop_loss')) {
-                        console.log(`⏸️ STOP LOSS hit for ${tx.symbol} (${currentPrice} <= ${tx.stop_loss}) but skipped for user ${tx.user_id} (notif-stoploss toggle is OFF)`);
+                    const userIdStr = String(tx.user_id).trim();
+                    if (!isAlertEnabled(userIdStr, 'stop_loss')) {
+                        console.log(`⏸️ STOP LOSS hit for ${tx.symbol} (${currentPrice} <= ${tx.stop_loss}) but SKIPPED for user ${tx.user_id} (notif-stoploss toggle is OFF)`);
                     } else {
                         console.log(`🛑 STOP LOSS hit for ${tx.symbol}: ${currentPrice} <= ${tx.stop_loss}`);
                         updatesToProcess.push({
@@ -219,7 +293,12 @@ export default async function handler(req, res) {
         // Step 6: Process all updates
         if (updatesToProcess.length === 0) {
             console.log('No price targets were hit this cycle.');
-            return res.status(200).json({ message: 'No targets hit.' });
+            return res.status(200).json({ 
+                message: 'No targets hit.',
+                usersWithSettings: Object.keys(userSettingsMap).length,
+                usersInWatchlist: watchlist ? watchlist.length : 0,
+                usersInTransactions: transactions ? transactions.length : 0
+            });
         }
 
         console.log(`Processing ${updatesToProcess.length} target hits...`);
@@ -254,7 +333,6 @@ export default async function handler(req, res) {
 
             // Mark the specific target as triggered based on source
             if (update.source === 'watchlist') {
-                // Update watchlist
                 let columnToUpdate = update.type === 'buy' ? 'buy_triggered' : 'sell_triggered';
                 const { error: updateError } = await supabase
                     .from('watchlist')
@@ -265,7 +343,6 @@ export default async function handler(req, res) {
                     console.error(`Failed to update watchlist ID ${update.watchlistId}:`, updateError);
                 }
             } else if (update.source === 'transaction' && update.type === 'stop_loss') {
-                // Update transactions table - mark stop loss as triggered
                 const { error: updateError } = await supabase
                     .from('transactions')
                     .update({ stop_loss_triggered: true })
