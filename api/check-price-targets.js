@@ -8,13 +8,15 @@ const supabase = createClient(
 );
 
 // --- Supabase Admin Client (Settings DB - DB2) ---
-const supabaseSettingsUrl = process.env.SUPABASE_URL_2 || process.env.SUPABASE_URL2 || process.env.SUPABASE_URL;
-const supabaseSettingsKey = process.env.SUPABASE_SERVICE_ROLE_KEY_2 || process.env.SUPABASE_SERVICE_ROLE_KEY2 || process.env.SUPABASE_SECRET_KEY_2 || process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseSettingsUrl = process.env.SUPABASE_URL_2 || process.env.SUPABASE_URL2;
+const supabaseSettingsKey = process.env.SUPABASE_SERVICE_ROLE_KEY_2 || process.env.SUPABASE_SERVICE_ROLE_KEY2 || process.env.SUPABASE_SECRET_KEY_2;
 
-const supabaseSettings = createClient(
-    supabaseSettingsUrl,
-    supabaseSettingsKey
-);
+let supabaseSettings = null;
+if (supabaseSettingsUrl && supabaseSettingsKey) {
+    supabaseSettings = createClient(supabaseSettingsUrl, supabaseSettingsKey);
+} else {
+    console.warn('⚠️ WARNING: SUPABASE_URL_2 and SUPABASE_SERVICE_ROLE_KEY_2 are missing in Environment Variables! User alert toggles (user_settings) will be bypassed until these variables are added.');
+}
 
 // --- Helper: Fetch current prices from the NEPSE API ---
 async function getCurrentPrices() {
@@ -98,21 +100,25 @@ export default async function handler(req, res) {
 
         const userSettingsMap = {};
         if (userIds.length > 0) {
-            try {
-                const { data: settingsData, error: settingsError } = await supabaseSettings
-                    .from('user_settings')
-                    .select('user_id, preferences')
-                    .in('user_id', userIds);
+            if (!supabaseSettings) {
+                console.warn('⚠️ Skipping user_settings query: SUPABASE_URL_2 and SUPABASE_SERVICE_ROLE_KEY_2 are missing in Vercel Environment Variables.');
+            } else {
+                try {
+                    const { data: settingsData, error: settingsError } = await supabaseSettings
+                        .from('user_settings')
+                        .select('user_id, preferences')
+                        .in('user_id', userIds);
 
-                if (settingsError) {
-                    console.warn('Could not fetch user_settings from Supabase 2, defaulting to enabled:', settingsError.message);
-                } else if (settingsData) {
-                    for (const row of settingsData) {
-                        userSettingsMap[String(row.user_id)] = row.preferences || {};
+                    if (settingsError) {
+                        console.warn('Could not fetch user_settings from Supabase 2, defaulting to enabled:', settingsError.message);
+                    } else if (settingsData) {
+                        for (const row of settingsData) {
+                            userSettingsMap[String(row.user_id)] = row.preferences || {};
+                        }
                     }
+                } catch (err) {
+                    console.warn('Error querying user_settings from Supabase 2:', err.message);
                 }
-            } catch (err) {
-                console.warn('Error querying user_settings from Supabase 2:', err.message);
             }
         }
 
