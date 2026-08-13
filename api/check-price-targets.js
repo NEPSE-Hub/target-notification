@@ -7,16 +7,13 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// --- Supabase Admin Client (Settings DB - DB2) ---
+// --- Supabase Admin Client (Settings DB - DB2 with DB1 fallback) ---
 const supabaseSettingsUrl = process.env.SUPABASE_URL_2 || process.env.SUPABASE_URL2;
 const supabaseSettingsKey = process.env.SUPABASE_SERVICE_ROLE_KEY_2 || process.env.SUPABASE_SERVICE_ROLE_KEY2 || process.env.SUPABASE_SECRET_KEY_2;
 
-let supabaseSettings = null;
-if (supabaseSettingsUrl && supabaseSettingsKey) {
-    supabaseSettings = createClient(supabaseSettingsUrl, supabaseSettingsKey);
-} else {
-    console.warn('⚠️ WARNING: SUPABASE_URL_2 and SUPABASE_SERVICE_ROLE_KEY_2 are missing in Environment Variables! User alert toggles (user_settings) will be bypassed until these variables are added.');
-}
+const supabaseSettings = (supabaseSettingsUrl && supabaseSettingsKey)
+    ? createClient(supabaseSettingsUrl, supabaseSettingsKey)
+    : supabase;
 
 // --- Helper: Fetch current prices from the NEPSE API ---
 async function getCurrentPrices() {
@@ -92,42 +89,55 @@ export default async function handler(req, res) {
             throw new Error('Failed to fetch current prices from NEPSE API');
         }
 
-        // Step 3.5: Fetch user alert preferences from user_settings table (Supabase DB 2)
-        const userIds = [...new Set([
-            ...(watchlist || []).map(w => String(w.user_id)),
-            ...(transactions || []).map(t => String(t.user_id))
-        ])].filter(Boolean);
-
+        // Step 3.5: Fetch user alert preferences from user_settings table
         const userSettingsMap = {};
-        if (userIds.length > 0) {
-            if (!supabaseSettings) {
-                console.warn('⚠️ Skipping user_settings query: SUPABASE_URL_2 and SUPABASE_SERVICE_ROLE_KEY_2 are missing in Vercel Environment Variables.');
-            } else {
-                try {
-                    const { data: settingsData, error: settingsError } = await supabaseSettings
-                        .from('user_settings')
-                        .select('user_id, preferences')
-                        .in('user_id', userIds);
+        try {
+            const { data: settingsData, error: settingsError } = await supabaseSettings
+                .from('user_settings')
+                .select('*');
 
-                    if (settingsError) {
-                        console.warn('Could not fetch user_settings from Supabase 2, defaulting to enabled:', settingsError.message);
-                    } else if (settingsData) {
-                        for (const row of settingsData) {
-                            userSettingsMap[String(row.user_id)] = row.preferences || {};
+            if (settingsError) {
+                console.warn('Could not fetch user_settings, defaulting to enabled:', settingsError.message);
+            } else if (settingsData) {
+                for (const row of settingsData) {
+                    if (row.user_id) {
+                        let prefs = row.preferences || {};
+                        if (typeof prefs === 'string') {
+                            try { prefs = JSON.parse(prefs); } catch (e) {}
                         }
+                        const userKey = String(row.user_id).trim().toLowerCase();
+                        userSettingsMap[userKey] = { prefs, row };
+                        console.log(`📋 Loaded DB settings for user [${userKey}]:`, prefs);
                     }
-                } catch (err) {
-                    console.warn('Error querying user_settings from Supabase 2:', err.message);
                 }
             }
+        } catch (err) {
+            console.warn('Error querying user_settings:', err.message);
         }
 
+        const isFalse = (val) => val === false || val === 'false' || val === 0 || val === '0';
+
         const isAlertEnabled = (userId, alertType) => {
-            const prefs = userSettingsMap[String(userId)];
-            if (!prefs) return true; // Default to enabled if no preferences saved
-            if (alertType === 'buy') return prefs['notif-buy'] !== false;
-            if (alertType === 'sell') return prefs['notif-sell'] !== false;
-            if (alertType === 'stop_loss') return prefs['notif-stoploss'] !== false;
+            if (!userId) return true;
+            const key = String(userId).trim().toLowerCase();
+            const record = userSettingsMap[key];
+            if (!record) return true; // Default to enabled if no preferences row in DB
+
+            const { prefs, row } = record;
+
+            if (alertType === 'buy') {
+                const val = prefs['notif-buy'] ?? prefs['notif_buy'] ?? row['notif_buy'] ?? row['notif-buy'];
+                if (val !== undefined) return !isFalse(val);
+            }
+            if (alertType === 'sell') {
+                const val = prefs['notif-sell'] ?? prefs['notif_sell'] ?? row['notif_sell'] ?? row['notif-sell'];
+                if (val !== undefined) return !isFalse(val);
+            }
+            if (alertType === 'stop_loss') {
+                const val = prefs['notif-stoploss'] ?? prefs['notif_stoploss'] ?? prefs['notif-stop-loss'] ?? row['notif_stoploss'] ?? row['notif-stoploss'];
+                if (val !== undefined) return !isFalse(val);
+            }
+
             return true;
         };
 
