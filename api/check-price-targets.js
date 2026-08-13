@@ -1,10 +1,19 @@
 // api/check-price-targets.js
 import { createClient } from '@supabase/supabase-js';
 
-// --- Supabase Admin Client ---
+// --- Supabase Admin Client (Main DB for Watchlist & Transactions) ---
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// --- Supabase Admin Client (Settings DB - DB2) ---
+const supabaseSettingsUrl = process.env.SUPABASE_URL_2 || process.env.SUPABASE_URL2 || process.env.SUPABASE_URL;
+const supabaseSettingsKey = process.env.SUPABASE_SERVICE_ROLE_KEY_2 || process.env.SUPABASE_SERVICE_ROLE_KEY2 || process.env.SUPABASE_SECRET_KEY_2 || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabaseSettings = createClient(
+    supabaseSettingsUrl,
+    supabaseSettingsKey
 );
 
 // --- Helper: Fetch current prices from the NEPSE API ---
@@ -81,6 +90,41 @@ export default async function handler(req, res) {
             throw new Error('Failed to fetch current prices from NEPSE API');
         }
 
+        // Step 3.5: Fetch user alert preferences from user_settings table (Supabase DB 2)
+        const userIds = [...new Set([
+            ...(watchlist || []).map(w => String(w.user_id)),
+            ...(transactions || []).map(t => String(t.user_id))
+        ])].filter(Boolean);
+
+        const userSettingsMap = {};
+        if (userIds.length > 0) {
+            try {
+                const { data: settingsData, error: settingsError } = await supabaseSettings
+                    .from('user_settings')
+                    .select('user_id, preferences')
+                    .in('user_id', userIds);
+
+                if (settingsError) {
+                    console.warn('Could not fetch user_settings from Supabase 2, defaulting to enabled:', settingsError.message);
+                } else if (settingsData) {
+                    for (const row of settingsData) {
+                        userSettingsMap[String(row.user_id)] = row.preferences || {};
+                    }
+                }
+            } catch (err) {
+                console.warn('Error querying user_settings from Supabase 2:', err.message);
+            }
+        }
+
+        const isAlertEnabled = (userId, alertType) => {
+            const prefs = userSettingsMap[String(userId)];
+            if (!prefs) return true; // Default to enabled if no preferences saved
+            if (alertType === 'buy') return prefs['notif-buy'] !== false;
+            if (alertType === 'sell') return prefs['notif-sell'] !== false;
+            if (alertType === 'stop_loss') return prefs['notif-stoploss'] !== false;
+            return true;
+        };
+
         // Step 4: Evaluate watchlist items (buy/sell targets)
         const updatesToProcess = [];
 
@@ -93,29 +137,37 @@ export default async function handler(req, res) {
 
             // Check Buy Condition
             if (!item.buy_triggered && item.target_buy !== null && currentPrice <= item.target_buy) {
-                console.log(`✅ BUY target hit for ${item.symbol}: ${currentPrice} <= ${item.target_buy}`);
-                updatesToProcess.push({
-                    watchlistId: item.id,
-                    userId: item.user_id,
-                    symbol: item.symbol,
-                    targetPrice: item.target_buy,
-                    type: 'buy',
-                    price: currentPrice,
-                    source: 'watchlist'
-                });
+                if (!isAlertEnabled(item.user_id, 'buy')) {
+                    console.log(`⏸️ BUY target hit for ${item.symbol} (${currentPrice} <= ${item.target_buy}) but skipped for user ${item.user_id} (notif-buy toggle is OFF)`);
+                } else {
+                    console.log(`✅ BUY target hit for ${item.symbol}: ${currentPrice} <= ${item.target_buy}`);
+                    updatesToProcess.push({
+                        watchlistId: item.id,
+                        userId: item.user_id,
+                        symbol: item.symbol,
+                        targetPrice: item.target_buy,
+                        type: 'buy',
+                        price: currentPrice,
+                        source: 'watchlist'
+                    });
+                }
             }
             // Check Sell Condition
             else if (!item.sell_triggered && item.target_sell !== null && currentPrice >= item.target_sell) {
-                console.log(`✅ SELL target hit for ${item.symbol}: ${currentPrice} >= ${item.target_sell}`);
-                updatesToProcess.push({
-                    watchlistId: item.id,
-                    userId: item.user_id,
-                    symbol: item.symbol,
-                    targetPrice: item.target_sell,
-                    type: 'sell',
-                    price: currentPrice,
-                    source: 'watchlist'
-                });
+                if (!isAlertEnabled(item.user_id, 'sell')) {
+                    console.log(`⏸️ SELL target hit for ${item.symbol} (${currentPrice} >= ${item.target_sell}) but skipped for user ${item.user_id} (notif-sell toggle is OFF)`);
+                } else {
+                    console.log(`✅ SELL target hit for ${item.symbol}: ${currentPrice} >= ${item.target_sell}`);
+                    updatesToProcess.push({
+                        watchlistId: item.id,
+                        userId: item.user_id,
+                        symbol: item.symbol,
+                        targetPrice: item.target_sell,
+                        type: 'sell',
+                        price: currentPrice,
+                        source: 'watchlist'
+                    });
+                }
             }
         }
 
@@ -130,16 +182,20 @@ export default async function handler(req, res) {
 
                 // Check Stop Loss Condition
                 if (currentPrice <= tx.stop_loss) {
-                    console.log(`🛑 STOP LOSS hit for ${tx.symbol}: ${currentPrice} <= ${tx.stop_loss}`);
-                    updatesToProcess.push({
-                        transactionId: tx.id,
-                        userId: tx.user_id,
-                        symbol: tx.symbol,
-                        targetPrice: tx.stop_loss,
-                        type: 'stop_loss',
-                        price: currentPrice,
-                        source: 'transaction'
-                    });
+                    if (!isAlertEnabled(tx.user_id, 'stop_loss')) {
+                        console.log(`⏸️ STOP LOSS hit for ${tx.symbol} (${currentPrice} <= ${tx.stop_loss}) but skipped for user ${tx.user_id} (notif-stoploss toggle is OFF)`);
+                    } else {
+                        console.log(`🛑 STOP LOSS hit for ${tx.symbol}: ${currentPrice} <= ${tx.stop_loss}`);
+                        updatesToProcess.push({
+                            transactionId: tx.id,
+                            userId: tx.user_id,
+                            symbol: tx.symbol,
+                            targetPrice: tx.stop_loss,
+                            type: 'stop_loss',
+                            price: currentPrice,
+                            source: 'transaction'
+                        });
+                    }
                 }
             }
         }
